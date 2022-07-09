@@ -22,3 +22,5 @@ int resolve_hostname(char *hostname, sockaddr_in *sockaddr);
 void export_bin(char *data, int len);
 
 void print_data(char *data, int len);
+
+size_t get_sockaddr_len(struct sockaddr *addr);

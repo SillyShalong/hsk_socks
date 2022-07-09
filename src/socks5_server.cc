@@ -4,6 +4,7 @@
 #include "socks5.h"
 #include "sockutils.h"
 #include <cassert>
+#include "util.h"
 
 using std::cout;
 using std::endl;
@@ -16,10 +17,9 @@ static struct ev_signal sigterm_watcher;
 static struct ev_signal sigchld_watcher;
 static struct ev_signal sigusr1_watcher;
 
-
-static void
-signal_cb(EV_P_ ev_signal *w, int revents)
-{
+#define IPV4_INADDR_LEN (socklen_t) sizeof(in_addr)
+#define PORT_LEN (uint16_t) sizeof(in_port_t)
+static void signal_cb(EV_P_ ev_signal *w, int revents) {
     if (revents & EV_SIGNAL) {
         switch (w->signum) {
 #ifndef __MINGW32__
@@ -49,7 +49,6 @@ signal_cb(EV_P_ ev_signal *w, int revents)
 }
 
 static void close_and_free_server(struct ev_loop* loop, server_t* server) {
-    //std::cout << "close_and_free_server, server->fd: " << server->fd << std::endl;
     if (server->read_io_ctx) {
         ev_io_stop(loop, &server->read_io_ctx->io);
     }
@@ -60,6 +59,7 @@ static void close_and_free_server(struct ev_loop* loop, server_t* server) {
     server->write_io_ctx = nullptr;
     if (server->fd > 0) {
         close(server->fd);
+        LOG_INFO("close_downstream, server->fd: %i\n", server->fd);
     }
     if (server->buffer) {
         if (server->buffer->data) {
@@ -72,15 +72,17 @@ static void close_and_free_server(struct ev_loop* loop, server_t* server) {
 }
 
 static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
-    //std::cout << "close_and_free_remote, remote->fd: " << remote->fd << std::endl;
     if (remote->read_io_ctx) {
         ev_io_stop(loop, &remote->read_io_ctx->io);
     }
+    remote->read_io_ctx = nullptr;
     if (remote->write_io_ctx) {
         ev_io_stop(loop, &remote->write_io_ctx->io);
     }
+    remote->write_io_ctx = nullptr;
     if (remote->fd > 0) {
         close(remote->fd);
+        LOG_INFO("close_upstream, server->fd: %i\n", remote->fd);
     }
     if (remote->buffer) {
         if (remote->buffer->data) {
@@ -142,44 +144,42 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
         return; // 需要继续等待完整的客户端协议数据
     }
     if (request->cmd == SOCKS5_CMD_CONNECT) {
-        uint16_t dst_port;
-        sockaddr_in remote_addr = {};
+        sockaddr_in remote_addr{};
         if (request->atyp == SOCKS5_ATYP_IPV4) {
-            int ipv4_addr_len = sizeof(in_addr);
-            int ipv4_dst_connect = int(sizeof(socks5_request) + ipv4_addr_len + 2);
-            if (buffer->len < ipv4_dst_connect) {
+            int request_len = int(sizeof(socks5_request) + IPV4_INADDR_LEN + PORT_LEN);
+            if (buffer->len < request_len) {
                 return; // 需要继续等待完整的客户端协议数据
             }
-            char ipv4_addr_name[16];
+            char ipv4_addr_name[INET_ADDRSTRLEN];
             memset(ipv4_addr_name, 0, sizeof(ipv4_addr_name));
             char* ipv4_addr_ptr = buffer->data + sizeof(socks5_request);
-            char* port_ptr = buffer->data + sizeof(socks5_request) + ipv4_addr_len;
-            dst_port = *(uint16_t *) port_ptr;
-            inet_ntop(AF_INET, ipv4_addr_ptr, ipv4_addr_name, INET_ADDRSTRLEN);
+            char* port_ptr = buffer->data + sizeof(socks5_request) + IPV4_INADDR_LEN;
+            uint16_t remote_port = *(uint16_t *) port_ptr;
+            inet_ntop(AF_INET, ipv4_addr_ptr, ipv4_addr_name, sizeof(ipv4_addr_name));
             sockaddr_in sock_addr = {};
             memset(&sock_addr, 0, sizeof(sockaddr_in));
-            char response_buff[1024];
+            char response_buff[256];
             socks5_response response = {};
             response.ver = SVERSION;
             response.rep = SOCKS5_REP_SUCCEEDED;
             response.rsv = 0x00;
-            response.atyp = request->atyp;
+            response.atyp = SOCKS5_ATYP_IPV4;
             memcpy(response_buff, &response, sizeof(socks5_response));
             memcpy(response_buff + sizeof(socks5_response), &sock_addr.sin_addr, sizeof(sock_addr.sin_addr));
             memcpy(response_buff + sizeof(socks5_response) + sizeof(sock_addr.sin_addr), &sock_addr.sin_port, sizeof(sock_addr.sin_port));
             int reply_size = sizeof(struct socks5_response) + sizeof(sock_addr.sin_addr) + sizeof(sock_addr.sin_port);
             int send_size = (int) send(server->fd, response_buff, reply_size, 0);
             if (send_size < reply_size) {
-                std::cerr << "handshake failure" << endl;
+                LOG_ERROR("handshake failure fd:%i\n", server->fd);
                 close_and_free_server(loop, server);
                 return;
             }
             remote_addr.sin_family = AF_INET;
-            remote_addr.sin_port = dst_port;
+            remote_addr.sin_port = remote_port;
             memcpy(&remote_addr.sin_addr.s_addr, ipv4_addr_ptr, sizeof(in_addr_t));
-            buffer->len -= ipv4_dst_connect;
+            buffer->len -= request_len;
             if (buffer->len > 0) {
-                memmove(buffer->data, buffer->data + ipv4_dst_connect, buffer->len);
+                memmove(buffer->data, buffer->data + request_len, buffer->len);
             }
         } else if (request->atyp == SOCKS5_ATYP_DOMAIN) {
             int8_t domain_name_len = request->dst_var[0];
@@ -189,17 +189,17 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             }
             char domain_name[domain_name_len+1];
             domain_name[domain_name_len] = '\0';
-            uint16_t port_num = ntohs(*(uint16_t *) &request->dst_var[domain_name_len + 1]);
+            uint16_t nport_num = *(uint16_t *) &request->dst_var[domain_name_len + 1];
             memcpy(domain_name, &request->dst_var[1], domain_name_len);
             if (resolve_hostname(domain_name, &remote_addr) == -1) {
-                std::cerr << "resolve hostname failure: " << domain_name << std::endl;
+                LOG_ERROR("resolve hostname failure, fd:%i domain:%s\n", server->fd, domain_name);
                 close_and_free_server(loop, server);
-                close_and_free_remote(loop, server->remote);
                 return;
             }
-            remote_addr.sin_port = htons(port_num);
-            char ipbuf[16];
-            cout << "dst host: " << domain_name << "(" << inet_ntop(AF_INET, &remote_addr.sin_addr, ipbuf, 16) << ")" << " dst port: " << port_num << " ";
+            remote_addr.sin_port = nport_num;
+            char ipv4_addr_name[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &remote_addr.sin_addr, ipv4_addr_name, sizeof(ipv4_addr_name));
+            cout << "dst host: " << domain_name << "(" << ipv4_addr_name << ")" << " dst port: " << ntohs(nport_num) << " " << std::endl;
             // reply to client fake
             sockaddr_in fake {};
             memset(&fake, 0, sizeof(fake));
@@ -210,12 +210,12 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             response.rsv = 0x00;
             response.atyp = SOCKS5_ATYP_IPV4;
             memcpy(response_buff, &response, sizeof(socks5_response));
-            memcpy(response_buff + sizeof(socks5_response), &fake.sin_addr, sizeof(fake.sin_addr));
-            memcpy(response_buff + sizeof(socks5_response) + sizeof(fake.sin_addr), &fake.sin_port, sizeof(fake.sin_port));
-            int reply_size = sizeof(struct socks5_response) + sizeof(fake.sin_addr) + sizeof(fake.sin_port);
+            memcpy(response_buff + sizeof(socks5_response), &fake.sin_addr, IPV4_INADDR_LEN);
+            memcpy(response_buff + sizeof(socks5_response) + IPV4_INADDR_LEN, &fake.sin_port, sizeof(fake.sin_port));
+            int reply_size = sizeof(struct socks5_response) + IPV4_INADDR_LEN + sizeof(fake.sin_port);
             int send_size = (int) send(server->fd, response_buff, reply_size, 0);
             if (send_size < reply_size) {
-                std::cerr << "handshake failure" << endl;
+                LOG_ERROR("handshake failure fd:%i\n", server->fd);
                 close_and_free_server(loop, server);
                 return;
             }
@@ -224,28 +224,18 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
                 memmove(buffer->data, buffer->data + domain_connect_len, buffer->len);
             }
         } else if (request->atyp == SOCKS5_ATYP_IPV6) {
-            std::cerr << "does not support ipv6 yet" << std::endl;
+            close_and_free_server(loop, server);
+            LOG_ERROR("does not support ipv6 fd:%i\n", server->fd);
             return;
         }
-
-        // TODO connect
         // 开启sockserver 和 remote server的通道
         if ((server->remote->fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
             close_and_free_server(loop, server);
-        }
-        socklen_t sock_len = sizeof(sockaddr_in);
-        cout << "start connect" << endl;
-        if (connect(server->remote->fd, reinterpret_cast<struct sockaddr *>(&remote_addr), sock_len) == -1) {
-            perror("connect remote");
-            close_and_free_server(loop, server);
-            close_and_free_remote(loop, server->remote);
             return;
-        } else {
-            std::cout << "connected" << std::endl;
         }
         sock_set_nonblock(server->remote->fd);
-
-
+        memcpy(&(server->remote->addr), &remote_addr, sizeof(remote_addr));
+        server->remote->addr_len = sizeof(remote_addr);
         server->stage = SOCKS5_STAGE_STREAM;
         ev_io_init(&server->remote->read_io_ctx->io, remote_read_cb, server->remote->fd, EV_READ);
         ev_io_init(&server->remote->write_io_ctx->io, remote_write_cb, server->remote->fd, EV_WRITE);
@@ -260,14 +250,31 @@ static void socks_stream(struct ev_loop* loop, server_t* server) {
     remote_t* remote = server->remote;
     buffer_t* buffer = remote->buffer;
     // append server buffer -> remote buffer
-//    print_data(server->buffer->data, server->buffer->len);
     if (buffer->len + server->buffer->len > SOCKET_BUF_SIZE) {
-        std::cout << "shit" << std::endl;
+        buffer->data = (char*) realloc(buffer->data, buffer->len + server->buffer->len);
     }
     memcpy(buffer->data + buffer->len, server->buffer->data, server->buffer->len);
     buffer->len += server->buffer->len;
     // reset server buffer
     server->buffer->len = 0;
+    if (!remote->connected) {
+        int conn_ret = connect(server->remote->fd,(sockaddr*)& remote->addr, remote->addr_len);
+        if (conn_ret == 0) {
+            server->remote->connected = true;
+            return;
+        } else if (conn_ret == -1) {
+            if (errno != EINPROGRESS) {
+                ERROR_LOG("connect remote");
+                close_and_free_server(loop, server);
+                close_and_free_remote(loop, server->remote);
+                return;
+            } else {
+                ev_io_stop(loop, &server->read_io_ctx->io);
+                ev_io_start(loop, &remote->write_io_ctx->io);
+                return;
+            }
+        }
+    }
     // relay data stream to remote dst
     int send_n = (int) send(remote->fd, buffer->data, buffer->len, 0);
     if (send_n == 0) {
@@ -281,7 +288,7 @@ static void socks_stream(struct ev_loop* loop, server_t* server) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             send_n = 0; // watch upstream ev watch
         } else {
-            perror("relay to remote stream");
+            ERROR_LOG("relay to remote stream");
             close_and_free_server(loop, server);
             close_and_free_remote(loop, remote);
         }
@@ -315,7 +322,7 @@ static void sock_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             } else {
-                perror("read_cb");
+                ERROR_LOG("read_cb");
                 close_and_free_server(loop, server_ctx->server);
                 close_and_free_remote(loop, server->remote);
                 return;
@@ -359,7 +366,7 @@ static void sock_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             } else {
-                perror("sock_write_cb");
+                ERROR_LOG("sock_write_cb");
                 close_and_free_server(loop, server);
                 close_and_free_remote(loop, remote);
                 return;
@@ -384,7 +391,7 @@ static void sock_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
         socklen_t addr_len = sizeof(addr);
         int client_fd = accept(watcher->fd, &addr, &addr_len);
         if (client_fd == -1) {
-            perror("accept client failure");
+            ERROR_LOG("accept client failure");
             return;
         }
         //std::cout << "accept client: " << client_fd << std::endl;
@@ -402,6 +409,7 @@ static void sock_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
 
         auto* remote = static_cast<remote_t*>(malloc(sizeof(remote_t)));
         remote->fd = -1;
+        remote->connected = false;
         remote->buffer = static_cast<buffer_t *>(malloc(sizeof(buffer_t)));
         remote->buffer->data = static_cast<char *>(malloc(SOCKET_BUF_SIZE));
         remote->buffer->len = 0;
@@ -435,7 +443,7 @@ static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             } else {
-                perror("remote_read_cb");
+                ERROR_LOG("remote_read_cb");
                 close_and_free_server(loop, server);
                 close_and_free_remote(loop, remote);
                 return;
@@ -448,7 +456,7 @@ static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 relay_back_n = 0; // to register ev watcher
             } else {
-                perror("relay_back_send");
+                ERROR_LOG("relay_back_send");
                 close_and_free_server(loop, server);
                 close_and_free_remote(loop, remote);
                 return;
@@ -472,9 +480,30 @@ static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
     if (wevents == EV_WRITE) {
         auto* remote_ctx = (remote_ctx_t*) watcher;
         remote_t* remote = remote_ctx->remote;
+        server_t* server = remote->server;
+        if (!remote->connected) {
+            struct sockaddr_storage addr{};
+            socklen_t len = sizeof addr;
+            int r         = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
+            if (r == 0) {
+                remote->connected = true;
+                // no need to send any data
+                if (remote->buffer->len == 0) {
+                    ev_io_stop(loop, &remote->write_io_ctx->io);
+                    ev_io_start(loop, &server->read_io_ctx->io);
+                    return;
+                }
+                ev_io_start(loop, &server->read_io_ctx->io);
+            } else {
+                // not connected
+                ERROR_LOG("getpeername");
+                close_and_free_remote(loop, remote);
+                close_and_free_server(loop, server);
+                return;
+            }
+        }
         buffer_t* buffer = remote->buffer;
-        assert(buffer->len == 0);
-        int write_n = (int) send(remote->fd, buffer->data, SOCKET_BUF_SIZE, 0);
+        int write_n = (int) send(remote->fd, buffer->data, buffer->len, 0);
         if (write_n == 0) {
             close_and_free_server(loop, remote->server);
             close_and_free_remote(loop, remote);
@@ -484,7 +513,7 @@ static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             } else {
-                perror("remote_write_cb");
+                ERROR_LOG("remote_write_cb");
                 close_and_free_server(loop, remote->server);
                 close_and_free_remote(loop, remote);
                 return;
