@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 void sock_listening(int fd) {
-    int backlog = 10;
+    int backlog = 1024;
     if (listen(fd, backlog) == -1) {
         perror("listen to fd");
     }
@@ -42,7 +42,7 @@ int sock_create_bind(const char* addr, const char* port) {
         }
         int opt = 1;
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#ifdef SO_NOSIGPIPE // Apple有此功能
+#ifdef SO_NOSIGPIPE // MACOS has this
         setsockopt(listen_fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
         // reuse port

@@ -20,20 +20,6 @@ int main(int argc, char** argv) {
     ev_signal_start(EV_DEFAULT, &sigint_watcher);
     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
 
-
-#ifndef SO_NOSIGPIPE
-//    ev_signal_init(&sigpip_watcher, signal_cb, SIGPIPE);
-//    ev_signal_start(EV_DEFAULT, &sigpip_watcher);
-//    signal(SIGPIPE, SIG_IGN);
-//    signal(SIGABRT, SIG_IGN);
-//    sigaction(SIGPIPE,signal_cb, NULL);
-    auto temp = (struct sigaction){SIG_IGN};
-    sigaction(SIGPIPE, &temp, nullptr);
-
-    sigaction(SIGABRT, &temp, nullptr);
-
-#endif
-
     struct ev_io listen_ev_io = {};
     ev_io_init(&listen_ev_io, sock_accept_cb, listen_fd, EV_READ);
     ev_io_start(loop, &listen_ev_io);
