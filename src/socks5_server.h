@@ -1,7 +1,9 @@
 #pragma once
 
 #include <ev.h>
-#include <sys/socket.h>
+#include "sockutils.h"
+#include "util.h"
+#include "csignal"
 
 #define SOCKET_BUF_SIZE (16 * 1024 - 1) // 16383 Byte, equals to the max chunk size
 #define SOCKS5_STAGE_INIT 0
@@ -36,6 +38,7 @@ struct server_t {
 };
 
 struct remote_t {
+    ev_timer connect_timer_watcher;
     int fd;
     bool connected;
     buffer_t* buffer;
@@ -46,6 +49,14 @@ struct remote_t {
     socklen_t addr_len;
 };
 
+static struct ev_signal sigint_watcher;
+static struct ev_signal sigterm_watcher;
+static struct ev_signal sigusr1_watcher;
+static struct ev_signal sigpip_watcher;
+
+void signal_cb(struct ev_loop* loop, ev_signal *w, int revents);
+
+void sock_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents);
 
 
 

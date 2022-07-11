@@ -1,7 +1,10 @@
 #include <cstdlib>
-#include "sockutils.h"
-
-
+#include <sys/socket.h>
+#include <cstdio>
+#include <sys/fcntl.h>
+#include <netdb.h>
+#include <cstring>
+#include <unistd.h>
 
 void sock_listening(int fd) {
     int backlog = 10;

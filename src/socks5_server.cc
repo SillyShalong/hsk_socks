@@ -1,48 +1,25 @@
 #include "socks5_server.h"
-#include <iostream>
 #include <string>
 #include "socks5.h"
 #include "sockutils.h"
 #include <cassert>
-#include "util.h"
-
-using std::cout;
-using std::endl;
 
 static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents);
 static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents);
 
-static struct ev_signal sigint_watcher;
-static struct ev_signal sigterm_watcher;
-static struct ev_signal sigchld_watcher;
-static struct ev_signal sigusr1_watcher;
-
 #define IPV4_INADDR_LEN (socklen_t) sizeof(in_addr)
 #define PORT_LEN (uint16_t) sizeof(in_port_t)
-static void signal_cb(EV_P_ ev_signal *w, int revents) {
+#define CONNECT_TIMEOUT 10
+
+void signal_cb(struct ev_loop* loop, ev_signal *w, int revents) {
     if (revents & EV_SIGNAL) {
         switch (w->signum) {
-#ifndef __MINGW32__
-//            case SIGCHLD:
-//                if (!is_plugin_running()) {
-//                    LOGE("plugin service exit unexpectedly");
-//                    ret_val = -1;
-//                } else
-//                    return;
             case SIGUSR1:
-#endif
             case SIGINT:
             case SIGTERM:
                 ev_signal_stop(EV_DEFAULT, &sigint_watcher);
                 ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
-#ifndef __MINGW32__
-                ev_signal_stop(EV_DEFAULT, &sigchld_watcher);
                 ev_signal_stop(EV_DEFAULT, &sigusr1_watcher);
-#else
-                #ifndef LIB_ONLY
-            ev_io_stop(EV_DEFAULT, &plugin_watcher.io);
-#endif
-#endif
                 ev_unloop(EV_A_ EVUNLOOP_ALL);
         }
     }
@@ -72,13 +49,16 @@ static void close_and_free_server(struct ev_loop* loop, server_t* server) {
 }
 
 static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
-    if (remote->read_io_ctx) {
-        ev_io_stop(loop, &remote->read_io_ctx->io);
+    if (remote->connected) {
+        if (remote->read_io_ctx) {
+            ev_io_stop(loop, &remote->read_io_ctx->io);
+        }
+        if (remote->write_io_ctx) {
+            ev_io_stop(loop, &remote->write_io_ctx->io);
+        }
     }
+    ev_timer_stop(loop, &remote->connect_timer_watcher);
     remote->read_io_ctx = nullptr;
-    if (remote->write_io_ctx) {
-        ev_io_stop(loop, &remote->write_io_ctx->io);
-    }
     remote->write_io_ctx = nullptr;
     if (remote->fd > 0) {
         close(remote->fd);
@@ -94,12 +74,20 @@ static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
     }
 }
 
+static void remote_timeout_cb(struct ev_loop* loop, ev_timer *watcher, int revents) {
+    auto *remote = (remote_t*) watcher;
+    server_t *server = remote->server;
+    LOG_INFO("remote tcp connection timeout\n");
+    close_and_free_remote(loop, remote);
+    close_and_free_server(loop, server);
+}
+
 // socks5 method交换
 static void socks_init(struct ev_loop* loop, server_t* server) {
     buffer_t* buffer = server->buffer;
     auto* request = (method_select_request*) buffer->data;
     if (request->ver != SOCKS_VERSION) { // 只支持socks5
-        std::cerr << "sock ver not supported: " << (int)request->ver << std::endl;
+        LOG_WARN("sock ver not supported: %u\n", (int)request->ver);
         close_and_free_server(loop, server);
         return;
     }
@@ -120,7 +108,7 @@ static void socks_init(struct ev_loop* loop, server_t* server) {
         }
     }
     if (send(server->fd, &response, sizeof(response), 0) != sizeof(response)) {
-        std::cerr << "send method select response failed: " << std::endl;
+        LOG_WARN("send method select response failed\n");
         close_and_free_server(loop, server);
         return;
     }
@@ -199,7 +187,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             remote_addr.sin_port = nport_num;
             char ipv4_addr_name[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &remote_addr.sin_addr, ipv4_addr_name, sizeof(ipv4_addr_name));
-            cout << "dst host: " << domain_name << "(" << ipv4_addr_name << ")" << " dst port: " << ntohs(nport_num) << " " << std::endl;
+            LOG_INFO("dst: %s(%s):%u\n", domain_name, ipv4_addr_name, ntohs(nport_num));
             // reply to client fake
             sockaddr_in fake {};
             memset(&fake, 0, sizeof(fake));
@@ -228,7 +216,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             LOG_ERROR("does not support ipv6 fd:%i\n", server->fd);
             return;
         }
-        // 开启sockserver 和 remote server的通道
+        // create remote socket
         if ((server->remote->fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
             close_and_free_server(loop, server);
             return;
@@ -237,11 +225,13 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
         memcpy(&(server->remote->addr), &remote_addr, sizeof(remote_addr));
         server->remote->addr_len = sizeof(remote_addr);
         server->stage = SOCKS5_STAGE_STREAM;
-        ev_io_init(&server->remote->read_io_ctx->io, remote_read_cb, server->remote->fd, EV_READ);
+//        ev_io_init(&server->remote->read_io_ctx->io, remote_read_cb, server->remote->fd, EV_READ);
         ev_io_init(&server->remote->write_io_ctx->io, remote_write_cb, server->remote->fd, EV_WRITE);
         ev_io_start(loop, &server->remote->read_io_ctx->io);
     } else {
-        throw std::runtime_error(std::string ("only support socks5 connect command: ") + std::to_string((int)request->cmd));
+        close_and_free_server(loop, server);
+        close_and_free_remote(loop, server->remote);
+        LOG_WARN("only support socks5 connect command, client_request_cmd:%c\n", request->cmd);
     }
 }
 
@@ -258,17 +248,18 @@ static void socks_stream(struct ev_loop* loop, server_t* server) {
     // reset server buffer
     server->buffer->len = 0;
     if (!remote->connected) {
-        int conn_ret = connect(server->remote->fd,(sockaddr*)& remote->addr, remote->addr_len);
+        int conn_ret = connect(remote->fd,(sockaddr*)& remote->addr, remote->addr_len);
         if (conn_ret == 0) {
             server->remote->connected = true;
             return;
         } else if (conn_ret == -1) {
             if (errno != EINPROGRESS) {
-                ERROR_LOG("connect remote");
+                LOG_PERROR("connect remote");
                 close_and_free_server(loop, server);
                 close_and_free_remote(loop, server->remote);
                 return;
             } else {
+                ev_timer_start(loop, &remote->connect_timer_watcher);
                 ev_io_stop(loop, &server->read_io_ctx->io);
                 ev_io_start(loop, &remote->write_io_ctx->io);
                 return;
@@ -288,13 +279,12 @@ static void socks_stream(struct ev_loop* loop, server_t* server) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             send_n = 0; // watch upstream ev watch
         } else {
-            ERROR_LOG("relay to remote stream");
+            LOG_PERROR("relay to remote stream");
             close_and_free_server(loop, server);
             close_and_free_remote(loop, remote);
         }
     }
     if (send_n < buffer->len) {
-        std::cout << "upstream: send buffer len: " << send_n << " < " << buffer->len << std::endl;
         buffer->len -= send_n;
         memmove(buffer->data, buffer->data + send_n, buffer->len);
         ev_io_stop(loop, &remote->read_io_ctx->io);   // disable remote down stream watcher
@@ -322,7 +312,7 @@ static void sock_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             } else {
-                ERROR_LOG("read_cb");
+                LOG_PERROR("read_cb");
                 close_and_free_server(loop, server_ctx->server);
                 close_and_free_remote(loop, server->remote);
                 return;
@@ -332,16 +322,15 @@ static void sock_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
         // socks5协议解码
         while (true) {
             switch (server->stage) {
-                case 0: {
+                case SOCKS5_STAGE_INIT: {
                     socks_init(loop, server);
                     return;
                 }
-                case 1: {
-                    //export_bin(buff->data, buff->len);
+                case SOCKS5_STAGE_HANDSHAKE: {
                     socks_handshake(loop, server);
                     return;
                 }
-                case 2: {// stream
+                case SOCKS5_STAGE_STREAM: {
                     socks_stream(loop, server);
                     return;
                 }
@@ -366,7 +355,7 @@ static void sock_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             } else {
-                ERROR_LOG("sock_write_cb");
+                LOG_PERROR("sock_write_cb");
                 close_and_free_server(loop, server);
                 close_and_free_remote(loop, remote);
                 return;
@@ -385,19 +374,19 @@ static void sock_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
     }
 }
 
-static void sock_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
+void sock_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
     if (revents & EV_READ) {
         struct sockaddr addr = {};
         socklen_t addr_len = sizeof(addr);
         int client_fd = accept(watcher->fd, &addr, &addr_len);
         if (client_fd == -1) {
-            ERROR_LOG("accept client failure");
+            LOG_PERROR("accept client failure");
             return;
         }
-        //std::cout << "accept client: " << client_fd << std::endl;
         // 设置读写监听，创建local和remote context
         auto* server = static_cast<server_t*>(malloc(sizeof(remote_t)));
         server->fd = client_fd;
+        server->stage = SOCKS5_STAGE_INIT;
         server->buffer = static_cast<buffer_t *>(malloc(sizeof(buffer_t)));
         server->buffer->data = static_cast<char *>(malloc(SOCKET_BUF_SIZE));
         server->buffer->len = 0;
@@ -420,6 +409,7 @@ static void sock_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
         server->remote = remote;
         remote->server = server;
 
+        ev_timer_init(&remote->connect_timer_watcher, remote_timeout_cb, CONNECT_TIMEOUT, 0);
         ev_io_init(&server->read_io_ctx->io, sock_read_cb, client_fd, EV_READ);
         ev_io_init(&server->write_io_ctx->io, sock_write_cb, client_fd, EV_WRITE);
         ev_io_start(loop, &server->read_io_ctx->io);
@@ -443,7 +433,7 @@ static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             } else {
-                ERROR_LOG("remote_read_cb");
+                LOG_PERROR("remote_read_cb");
                 close_and_free_server(loop, server);
                 close_and_free_remote(loop, remote);
                 return;
@@ -455,7 +445,7 @@ static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 relay_back_n = 0; // to register ev watcher
             } else {
-                ERROR_LOG("relay_back_send");
+                LOG_PERROR("relay_back_send");
                 close_and_free_server(loop, server);
                 close_and_free_remote(loop, remote);
                 return;
@@ -483,19 +473,22 @@ static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
         if (!remote->connected) {
             struct sockaddr_storage addr{};
             socklen_t len = sizeof addr;
-            int r         = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
+            int r = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
             if (r == 0) {
                 remote->connected = true;
+                ev_timer_stop(loop, &remote->connect_timer_watcher);
                 // no need to send any data
                 if (remote->buffer->len == 0) {
                     ev_io_stop(loop, &remote->write_io_ctx->io);
                     ev_io_start(loop, &server->read_io_ctx->io);
                     return;
                 }
+                ev_io_init(&remote->read_io_ctx->io, remote_read_cb, remote->fd, EV_READ);
+                ev_io_start(loop, &remote->read_io_ctx->io);
                 ev_io_start(loop, &server->read_io_ctx->io);
             } else {
                 // not connected
-                ERROR_LOG("getpeername");
+                LOG_PERROR("getpeername");
                 close_and_free_remote(loop, remote);
                 close_and_free_server(loop, server);
                 return;
@@ -512,7 +505,7 @@ static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             } else {
-                ERROR_LOG("remote_write_cb");
+                LOG_PERROR("remote_write_cb");
                 close_and_free_server(loop, remote->server);
                 close_and_free_remote(loop, remote);
                 return;
@@ -529,29 +522,5 @@ static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
         ev_io_stop(loop, &remote->write_io_ctx->io);
         // recover remote downstream io
         ev_io_start(loop, &remote->read_io_ctx->io);
-    } else {
-        std::cerr << "remote_write_cb event unknown: " << wevents << std::endl;
     }
-}
-
-
-int main(int argc, char** argv) {
-    struct ev_loop *loop = EV_DEFAULT;
-    int listen_fd = sock_create_bind("127.0.0.1", "6788");
-    sock_set_nonblock(listen_fd);
-    std::cout << "socks server listening on: " << 6788 << std::endl;
-    sock_listening(listen_fd);
-//    ev_signal_init(&sigchld_watcher, signal_cb, SIGCHLD);
-//    ev_signal_start(EV_DEFAULT, &sigchld_watcher);
-
-    ev_signal_init(&sigint_watcher, signal_cb, SIGINT);
-    ev_signal_init(&sigterm_watcher, signal_cb, SIGTERM);
-    ev_signal_start(EV_DEFAULT, &sigint_watcher);
-    ev_signal_start(EV_DEFAULT, &sigterm_watcher);
-
-    struct ev_io listen_ev_io = {};
-    ev_io_init(&listen_ev_io, sock_accept_cb, listen_fd, EV_READ);
-    ev_io_start(loop, &listen_ev_io);
-    ev_loop(loop, 0);
-    return EXIT_SUCCESS;
 }
