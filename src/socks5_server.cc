@@ -20,57 +20,60 @@ void signal_cb(struct ev_loop* loop, ev_signal *w, int revents) {
                 ev_signal_stop(EV_DEFAULT, &sigint_watcher);
                 ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
                 ev_signal_stop(EV_DEFAULT, &sigusr1_watcher);
+                ev_signal_stop(EV_DEFAULT, &sigpip_watcher);
                 ev_unloop(EV_A_ EVUNLOOP_ALL);
         }
     }
 }
 
 static void close_and_free_server(struct ev_loop* loop, server_t* server) {
-    if (server->read_io_ctx) {
-        ev_io_stop(loop, &server->read_io_ctx->io);
-    }
-    server->read_io_ctx = nullptr;
-    if (server->write_io_ctx) {
-        ev_io_stop(loop, &server->write_io_ctx->io);
-    }
-    server->write_io_ctx = nullptr;
     if (server->fd > 0) {
+        if (server->read_io_ctx) {
+            ev_io_stop(loop, &server->read_io_ctx->io);
+        }
+        server->read_io_ctx = nullptr;
+        if (server->write_io_ctx) {
+            ev_io_stop(loop, &server->write_io_ctx->io);
+        }
+        server->write_io_ctx = nullptr;
+
         close(server->fd);
         LOG_INFO("close_downstream, server->fd: %i\n", server->fd);
-    }
-    if (server->buffer) {
-        if (server->buffer->data) {
-            free(server->buffer->data);
-            server->buffer->data = nullptr;
+
+        if (server->buffer) {
+            if (server->buffer->data) {
+                free(server->buffer->data);
+                server->buffer->data = nullptr;
+            }
+            free(server->buffer);
+            server->buffer = nullptr;
         }
-        free(server->buffer);
-        server->buffer = nullptr;
     }
 }
 
 static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
-    if (remote->connected) {
+    if (remote->fd > 0) {
+        ev_timer_stop(loop, &remote->connect_timer_watcher);
         if (remote->read_io_ctx) {
             ev_io_stop(loop, &remote->read_io_ctx->io);
         }
+        remote->read_io_ctx = nullptr;
         if (remote->write_io_ctx) {
             ev_io_stop(loop, &remote->write_io_ctx->io);
         }
-    }
-    ev_timer_stop(loop, &remote->connect_timer_watcher);
-    remote->read_io_ctx = nullptr;
-    remote->write_io_ctx = nullptr;
-    if (remote->fd > 0) {
+        remote->write_io_ctx = nullptr;
         close(remote->fd);
         LOG_INFO("close_upstream, server->fd: %i\n", remote->fd);
-    }
-    if (remote->buffer) {
-        if (remote->buffer->data) {
-            free(remote->buffer->data);
-            remote->buffer->data = nullptr;
+
+        remote->fd = 10000;
+        if (remote->buffer) {
+            if (remote->buffer->data) {
+                free(remote->buffer->data);
+                remote->buffer->data = nullptr;
+            }
+            free(remote->buffer);
+            remote->buffer = nullptr;
         }
-        free(remote->buffer);
-        remote->buffer = nullptr;
     }
 }
 
@@ -219,13 +222,14 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
         // create remote socket
         if ((server->remote->fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
             close_and_free_server(loop, server);
+
             return;
         }
         sock_set_nonblock(server->remote->fd);
         memcpy(&(server->remote->addr), &remote_addr, sizeof(remote_addr));
         server->remote->addr_len = sizeof(remote_addr);
         server->stage = SOCKS5_STAGE_STREAM;
-//        ev_io_init(&server->remote->read_io_ctx->io, remote_read_cb, server->remote->fd, EV_READ);
+        ev_io_init(&server->remote->read_io_ctx->io, remote_read_cb, server->remote->fd, EV_READ);
         ev_io_init(&server->remote->write_io_ctx->io, remote_write_cb, server->remote->fd, EV_WRITE);
         ev_io_start(loop, &server->remote->read_io_ctx->io);
     } else {
@@ -267,7 +271,7 @@ static void socks_stream(struct ev_loop* loop, server_t* server) {
         }
     }
     // relay data stream to remote dst
-    int send_n = (int) send(remote->fd, buffer->data, buffer->len, 0);
+    int send_n = (int) send(remote->fd, buffer->data, buffer->len, MSG_NOSIGNAL);
     if (send_n == 0) {
         // nonblock socket should close when send_n==0
         close_and_free_server(loop, server);
@@ -421,6 +425,9 @@ static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
     if (revents == EV_READ) {
         auto* remote_ctx = (remote_ctx_t*) watcher;
         remote_t* remote = remote_ctx->remote;
+        if (!remote->connected) {
+            return;
+        }
         server_t* server = remote->server;
         buffer_t* buffer = remote->buffer;
         int read_n = (int) recv(remote->fd, buffer->data + buffer->len, SOCKET_BUF_SIZE - buffer->len, 0);
@@ -473,28 +480,28 @@ static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
         if (!remote->connected) {
             struct sockaddr_storage addr{};
             socklen_t len = sizeof addr;
-            int r = getpeername(remote->fd, (struct sockaddr *)&addr, &len);
-            if (r == 0) {
-                remote->connected = true;
-                ev_timer_stop(loop, &remote->connect_timer_watcher);
-                // no need to send any data
-                if (remote->buffer->len == 0) {
-                    ev_io_stop(loop, &remote->write_io_ctx->io);
+            if (remote->fd > 0) {
+                int r = getpeername(remote->fd, (struct sockaddr *) &addr, &len);
+                if (r == 0) {
+                    ev_timer_stop(loop, &remote->connect_timer_watcher);
+                    remote->connected = true;
+                    if (remote->buffer->len == 0) {
+                        ev_io_stop(loop, &remote->write_io_ctx->io);
+                        ev_io_start(loop, &server->read_io_ctx->io);
+                        return;
+                    }
+                    ev_io_start(loop, &remote->read_io_ctx->io);
                     ev_io_start(loop, &server->read_io_ctx->io);
+                } else {
+                    LOG_PERROR("getpeername");
+                    // not connected
+                    close_and_free_remote(loop, remote);
+                    close_and_free_server(loop, server);
                     return;
                 }
-                ev_io_init(&remote->read_io_ctx->io, remote_read_cb, remote->fd, EV_READ);
-                ev_io_start(loop, &remote->read_io_ctx->io);
-                ev_io_start(loop, &server->read_io_ctx->io);
-            } else {
-                // not connected
-                LOG_PERROR("getpeername");
-                close_and_free_remote(loop, remote);
-                close_and_free_server(loop, server);
-                return;
             }
         }
-        buffer_t* buffer = remote->buffer;
+        buffer_t *buffer = remote->buffer;
         int write_n = (int) send(remote->fd, buffer->data, buffer->len, 0);
         if (write_n == 0) {
             close_and_free_server(loop, remote->server);
