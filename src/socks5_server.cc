@@ -98,7 +98,7 @@ static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
 static void socks_init(struct ev_loop* loop, server_t* server) {
     buffer_t* buffer = server->buffer;
     auto* request = (method_select_request*) buffer->data;
-    if (request->ver != SVERSION) { // 只支持socks5
+    if (request->ver != SOCKS_VERSION) { // 只支持socks5
         std::cerr << "sock ver not supported: " << (int)request->ver << std::endl;
         close_and_free_server(loop, server);
         return;
@@ -111,11 +111,11 @@ static void socks_init(struct ev_loop* loop, server_t* server) {
     }
     method_select_response response = {};
     response.ver = request->ver;
-    response.method = METHOD_UNACCEPTABLE;
+    response.method = SOCKS5_METHOD_UNACCEPTABLE;
     // 只支持no auth
     for (int method_num = 0; method_num < request->nmethods; ++method_num) {
-        if (request->methods[method_num] == METHOD_NOAUTH) {
-            response.method = METHOD_NOAUTH;
+        if (request->methods[method_num] == SOCKS5_METHOD_NOAUTH) {
+            response.method = SOCKS5_METHOD_NOAUTH;
             break;
         }
     }
@@ -124,7 +124,7 @@ static void socks_init(struct ev_loop* loop, server_t* server) {
         close_and_free_server(loop, server);
         return;
     }
-    if (response.method == METHOD_UNACCEPTABLE) {
+    if (response.method == SOCKS5_METHOD_UNACCEPTABLE) {
         close_and_free_server(loop, server);
         return;
     }
@@ -160,7 +160,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             memset(&sock_addr, 0, sizeof(sockaddr_in));
             char response_buff[256];
             socks5_response response = {};
-            response.ver = SVERSION;
+            response.ver = SOCKS_VERSION;
             response.rep = SOCKS5_REP_SUCCEEDED;
             response.rsv = 0x00;
             response.atyp = SOCKS5_ATYP_IPV4;
@@ -205,7 +205,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             memset(&fake, 0, sizeof(fake));
             char response_buff[1024];
             socks5_response response = {};
-            response.ver = SVERSION;
+            response.ver = SOCKS_VERSION;
             response.rep = SOCKS5_REP_SUCCEEDED;
             response.rsv = 0x00;
             response.atyp = SOCKS5_ATYP_IPV4;
@@ -451,7 +451,6 @@ static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
         }
         buffer->len += read_n;
         int relay_back_n = (int) send(server->fd, buffer->data, buffer->len, 0);
-        //std::cout << std::string(buffer->data) << std::endl;
         if (relay_back_n == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 relay_back_n = 0; // to register ev watcher

@@ -1,10 +1,9 @@
 #pragma once
 
-#define SVERSION 0x05
-#define METHOD_NOAUTH 0x00
-#define METHOD_UNACCEPTABLE 0xff
+#define SOCKS_VERSION 0x05
+#define SOCKS5_METHOD_NOAUTH 0x00
+#define SOCKS5_METHOD_UNACCEPTABLE 0xff
 
-// see also: https://www.ietf.org/rfc/rfc1928.txt
 #define SOCKS5_CMD_CONNECT 0x01
 #define SOCKS5_CMD_BIND 0x02
 #define SOCKS5_CMD_UDP_ASSOCIATE 0x03
