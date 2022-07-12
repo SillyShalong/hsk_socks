@@ -38,7 +38,7 @@ static void close_and_free_server(struct ev_loop* loop, server_t* server) {
         server->write_io_ctx = nullptr;
 
         close(server->fd);
-        LOG_INFO("close_downstream, server->fd: %i\n", server->fd);
+        //LOG_INFO("close_downstream, server->fd: %i", server->fd);
 
         if (server->buffer) {
             if (server->buffer->data) {
@@ -63,7 +63,7 @@ static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
         }
         remote->write_io_ctx = nullptr;
         close(remote->fd);
-        LOG_INFO("close_upstream, server->fd: %i\n", remote->fd);
+        //LOG_INFO("close_upstream, server->fd: %i", remote->fd);
 
         remote->fd = 10000;
         if (remote->buffer) {
@@ -80,7 +80,7 @@ static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
 static void remote_timeout_cb(struct ev_loop* loop, ev_timer *watcher, int revents) {
     auto *remote = (remote_t*) watcher;
     server_t *server = remote->server;
-    LOG_INFO("remote tcp connection timeout\n");
+    LOG_INFO("remote tcp connection timeout");
     close_and_free_remote(loop, remote);
     close_and_free_server(loop, server);
 }
@@ -90,7 +90,7 @@ static void socks_init(struct ev_loop* loop, server_t* server) {
     buffer_t* buffer = server->buffer;
     auto* request = (method_select_request*) buffer->data;
     if (request->ver != SOCKS_VERSION) { // 只支持socks5
-        LOG_WARN("sock ver not supported: %u\n", (int)request->ver);
+        LOG_WARN("sock ver not supported: %u", (int)request->ver);
         close_and_free_server(loop, server);
         return;
     }
@@ -111,7 +111,7 @@ static void socks_init(struct ev_loop* loop, server_t* server) {
         }
     }
     if (send(server->fd, &response, sizeof(response), 0) != sizeof(response)) {
-        LOG_WARN("send method select response failed\n");
+        LOG_WARN("send method select response failed");
         close_and_free_server(loop, server);
         return;
     }
@@ -158,10 +158,11 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             memcpy(response_buff, &response, sizeof(socks5_response));
             memcpy(response_buff + sizeof(socks5_response), &sock_addr.sin_addr, sizeof(sock_addr.sin_addr));
             memcpy(response_buff + sizeof(socks5_response) + sizeof(sock_addr.sin_addr), &sock_addr.sin_port, sizeof(sock_addr.sin_port));
+            LOG_INFO("upstream -> %s:%u", ipv4_addr_name, ntohs(remote_port));
             int reply_size = sizeof(struct socks5_response) + sizeof(sock_addr.sin_addr) + sizeof(sock_addr.sin_port);
             int send_size = (int) send(server->fd, response_buff, reply_size, 0);
             if (send_size < reply_size) {
-                LOG_ERROR("handshake failure fd:%i\n", server->fd);
+                LOG_ERROR("handshake failure fd:%i", server->fd);
                 close_and_free_server(loop, server);
                 return;
             }
@@ -173,7 +174,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
                 memmove(buffer->data, buffer->data + request_len, buffer->len);
             }
         } else if (request->atyp == SOCKS5_ATYP_DOMAIN) {
-            int8_t domain_name_len = request->dst_var[0];
+            auto domain_name_len = (int8_t)request->dst_var[0];
             int domain_connect_len = int(sizeof(socks5_request) + 1 + domain_name_len + 2);
             if (buffer->len < domain_connect_len) {
                 return; // 需要继续等待完整的客户端协议数据
@@ -183,14 +184,14 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             uint16_t nport_num = *(uint16_t *) &request->dst_var[domain_name_len + 1];
             memcpy(domain_name, &request->dst_var[1], domain_name_len);
             if (resolve_hostname(domain_name, &remote_addr) == -1) {
-                LOG_ERROR("resolve hostname failure, fd:%i domain:%s\n", server->fd, domain_name);
+                LOG_ERROR("resolve hostname failure, fd:%i domain:%s", server->fd, domain_name);
                 close_and_free_server(loop, server);
                 return;
             }
             remote_addr.sin_port = nport_num;
             char ipv4_addr_name[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &remote_addr.sin_addr, ipv4_addr_name, sizeof(ipv4_addr_name));
-            LOG_INFO("dst: %s(%s):%u\n", domain_name, ipv4_addr_name, ntohs(nport_num));
+            LOG_INFO("upstream -> %s(%s):%u", domain_name, ipv4_addr_name, ntohs(nport_num));
             // reply to client fake
             sockaddr_in fake {};
             memset(&fake, 0, sizeof(fake));
@@ -206,7 +207,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             int reply_size = sizeof(struct socks5_response) + IPV4_INADDR_LEN + sizeof(fake.sin_port);
             int send_size = (int) send(server->fd, response_buff, reply_size, 0);
             if (send_size < reply_size) {
-                LOG_ERROR("handshake failure fd:%i\n", server->fd);
+                LOG_ERROR("handshake failure fd:%i", server->fd);
                 close_and_free_server(loop, server);
                 return;
             }
@@ -216,7 +217,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             }
         } else if (request->atyp == SOCKS5_ATYP_IPV6) {
             close_and_free_server(loop, server);
-            LOG_ERROR("does not support ipv6 fd:%i\n", server->fd);
+            LOG_ERROR("does not support ipv6 fd:%i", server->fd);
             return;
         }
         // create remote socket
@@ -235,7 +236,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
     } else {
         close_and_free_server(loop, server);
         close_and_free_remote(loop, server->remote);
-        LOG_WARN("only support socks5 connect command, client_request_cmd:%c\n", request->cmd);
+        LOG_WARN("only support socks5 connect command, client_request_cmd:%c", request->cmd);
     }
 }
 

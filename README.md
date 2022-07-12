@@ -1,5 +1,6 @@
-# SOCKS5 server 
+# SOCKS5 server
 tested on macos and ubuntu20.04
+only support socks version 5
 
 PREREQUISITE:
 ```
@@ -29,3 +30,4 @@ TODO:
 2. support ipv6
 3. custom log
 4. support udp
+5. up/down speed monitor

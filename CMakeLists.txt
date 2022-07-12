@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.2)
 project(husk_socks)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -std=gnu99")
 include_directories(/opt/homebrew/Cellar/libev/4.33/include)
 find_library(LIBEV libev.a)
 add_executable(Socks5Server src/main.cc src/socks5_server.cc src/sockutils.cc src/util.cc)

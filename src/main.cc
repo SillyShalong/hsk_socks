@@ -8,10 +8,12 @@ int main(int argc, char** argv) {
         server_port = argv[2];
     }
     struct ev_loop *loop = EV_DEFAULT;
+
+    // create socks5 server socket
     int listen_fd = sock_create_bind(server_host, server_port);
-    setbuf(stdout, nullptr);
+
     sock_set_nonblock(listen_fd);
-    LOG_INFO("socks server listening on: %s\n", server_port);
+    LOG_INFO("socks server listening on: %s:%s", server_host, server_port);
     sock_listening(listen_fd);
     ev_signal_init(&sigusr1_watcher, signal_cb, SIGUSR1);
     ev_signal_init(&sigint_watcher, signal_cb, SIGINT);
