@@ -1,15 +1,7 @@
 #include "socks5_server.h"
-#include <string>
 #include "socks5.h"
 #include "sockutils.h"
-#include <cassert>
-
-static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents);
-static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents);
-
-#define IPV4_INADDR_LEN (socklen_t) sizeof(in_addr)
-#define PORT_LEN (uint16_t) sizeof(in_port_t)
-#define CONNECT_TIMEOUT 10
+#include <string>
 
 // handle ev signal
 void signal_cb(struct ev_loop* loop, ev_signal *w, int revents) {
@@ -80,12 +72,125 @@ static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
 }
 
 // handle when remote connect() timeout
-static void remote_timeout_cb(struct ev_loop* loop, ev_timer *watcher, int revents) {
+static void remote_timeout_cb(struct ev_loop* loop, ev_timer *watcher, int) {
     auto *remote = (remote_t*) watcher;
     server_t *server = remote->server;
     LOG_INFO("remote tcp connection timeout");
     close_and_free_remote(loop, remote);
     close_and_free_server(loop, server);
+}
+
+// upstream event read
+static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
+    if (revents == EV_READ) {
+        auto* remote_ctx = (remote_ctx_t*) watcher;
+        remote_t* remote = remote_ctx->remote;
+        if (!remote->connected) {
+            return;
+        }
+        server_t* server = remote->server;
+        buffer_t* buffer = remote->buffer;
+        int read_n = (int) recv(remote->fd, buffer->data + buffer->len, SOCKET_BUF_SIZE - buffer->len, 0);
+        if (read_n == 0) {
+            close_and_free_server(loop, server);
+            close_and_free_remote(loop, remote);
+            return;
+        }
+        if (read_n == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            } else {
+                LOG_PERROR("remote_read_cb");
+                close_and_free_server(loop, server);
+                close_and_free_remote(loop, remote);
+                return;
+            }
+        }
+        buffer->len += read_n;
+        int relay_back_n = (int) send(server->fd, buffer->data, buffer->len, 0);
+        if (relay_back_n == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                relay_back_n = 0; // to register ev watcher
+            } else {
+                LOG_PERROR("relay_back_send");
+                close_and_free_server(loop, server);
+                close_and_free_remote(loop, remote);
+                return;
+            }
+        }
+        if (relay_back_n < buffer->len) {
+            // watch ev send
+            server->buffer->len = buffer->len - relay_back_n;
+            memcpy(server->buffer->data, buffer->data + relay_back_n, server->buffer->len);
+            buffer->len = 0;
+            ev_io_stop(loop, &remote->read_io_ctx->io);
+            ev_io_stop(loop, &server->read_io_ctx->io);  // disable local upstream
+            ev_io_start(loop, &server->write_io_ctx->io);// enable local downstream
+            return;
+        }
+        buffer->len = 0;
+    }
+}
+
+// upstream event write
+static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
+    if (wevents == EV_WRITE) {
+        auto* remote_ctx = (remote_ctx_t*) watcher;
+        remote_t* remote = remote_ctx->remote;
+        server_t* server = remote->server;
+        if (!remote->connected) {
+            struct sockaddr_storage addr{};
+            socklen_t len = sizeof addr;
+            if (remote->fd > 0) {
+                int r = getpeername(remote->fd, (struct sockaddr *) &addr, &len);
+                if (r == 0) {
+                    ev_timer_stop(loop, &remote->connect_timer_watcher);
+                    remote->connected = true;
+                    if (remote->buffer->len == 0) {
+                        ev_io_stop(loop, &remote->write_io_ctx->io);
+                        ev_io_start(loop, &server->read_io_ctx->io);
+                        return;
+                    }
+                    ev_io_start(loop, &remote->read_io_ctx->io);
+                    ev_io_start(loop, &server->read_io_ctx->io);
+                } else {
+                    LOG_PERROR("getpeername");
+                    // not connected
+                    close_and_free_remote(loop, remote);
+                    close_and_free_server(loop, server);
+                    return;
+                }
+            }
+        }
+        buffer_t *buffer = remote->buffer;
+        int write_n = (int) send(remote->fd, buffer->data, buffer->len, 0);
+        if (write_n == 0) {
+            close_and_free_server(loop, remote->server);
+            close_and_free_remote(loop, remote);
+            return;
+        }
+        if (write_n == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            } else {
+                LOG_PERROR("remote_write_cb");
+                close_and_free_server(loop, remote->server);
+                close_and_free_remote(loop, remote);
+                return;
+            }
+        }
+        if (write_n < buffer->len) {
+            buffer->len -= write_n;
+            memmove(buffer->data, buffer->data + write_n, buffer->len);
+            return;
+        }
+        // remote upstream all sent
+        buffer->len = 0;
+        // disable remote upstream io
+        ev_io_stop(loop, &remote->write_io_ctx->io);
+        // recover remote downstream io
+        ev_io_start(loop, &remote->read_io_ctx->io);
+    }
 }
 
 // socks5 method exchange
@@ -286,7 +391,8 @@ static void socks_stream(struct ev_loop* loop, server_t* server) {
     ev_io_start(loop, &remote->read_io_ctx->io);
 }
 
-static void sock_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
+// socks5 event read
+static void socks_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
     if (revents == EV_READ) {
         auto *server_ctx = (server_ctx_t*) watcher;
         buffer_t* buff = server_ctx->server->buffer;
@@ -328,7 +434,8 @@ static void sock_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
     }
 }
 
-static void sock_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
+// socks5 event write
+static void socks_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
     if (wevents == EV_WRITE) {
         auto *server_ctx = (server_ctx_t *) watcher;
         server_t *server = server_ctx->server;
@@ -363,7 +470,7 @@ static void sock_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
     }
 }
 
-void sock_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
+void socks_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
     if (revents & EV_READ) {
         struct sockaddr addr = {};
         socklen_t addr_len = sizeof(addr);
@@ -399,120 +506,8 @@ void sock_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
         remote->server = server;
 
         ev_timer_init(&remote->connect_timer_watcher, remote_timeout_cb, CONNECT_TIMEOUT, 0);
-        ev_io_init(&server->read_io_ctx->io, sock_read_cb, client_fd, EV_READ);
-        ev_io_init(&server->write_io_ctx->io, sock_write_cb, client_fd, EV_WRITE);
+        ev_io_init(&server->read_io_ctx->io, socks_read_cb, client_fd, EV_READ);
+        ev_io_init(&server->write_io_ctx->io, socks_write_cb, client_fd, EV_WRITE);
         ev_io_start(loop, &server->read_io_ctx->io);
-    }
-}
-
-// upstream read
-static void remote_read_cb(struct ev_loop* loop, ev_io* watcher, int revents) {
-    if (revents == EV_READ) {
-        auto* remote_ctx = (remote_ctx_t*) watcher;
-        remote_t* remote = remote_ctx->remote;
-        if (!remote->connected) {
-            return;
-        }
-        server_t* server = remote->server;
-        buffer_t* buffer = remote->buffer;
-        int read_n = (int) recv(remote->fd, buffer->data + buffer->len, SOCKET_BUF_SIZE - buffer->len, 0);
-        if (read_n == 0) {
-            close_and_free_server(loop, server);
-            close_and_free_remote(loop, remote);
-            return;
-        }
-        if (read_n == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            } else {
-                LOG_PERROR("remote_read_cb");
-                close_and_free_server(loop, server);
-                close_and_free_remote(loop, remote);
-                return;
-            }
-        }
-        buffer->len += read_n;
-        int relay_back_n = (int) send(server->fd, buffer->data, buffer->len, 0);
-        if (relay_back_n == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                relay_back_n = 0; // to register ev watcher
-            } else {
-                LOG_PERROR("relay_back_send");
-                close_and_free_server(loop, server);
-                close_and_free_remote(loop, remote);
-                return;
-            }
-        }
-        if (relay_back_n < buffer->len) {
-            // watch ev send
-            server->buffer->len = buffer->len - relay_back_n;
-            memcpy(server->buffer->data, buffer->data + relay_back_n, server->buffer->len);
-            buffer->len = 0;
-            ev_io_stop(loop, &remote->read_io_ctx->io);
-            ev_io_stop(loop, &server->read_io_ctx->io);  // disable local upstream
-            ev_io_start(loop, &server->write_io_ctx->io);// enable local downstream
-            return;
-        }
-        buffer->len = 0;
-    }
-}
-
-static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents) {
-    if (wevents == EV_WRITE) {
-        auto* remote_ctx = (remote_ctx_t*) watcher;
-        remote_t* remote = remote_ctx->remote;
-        server_t* server = remote->server;
-        if (!remote->connected) {
-            struct sockaddr_storage addr{};
-            socklen_t len = sizeof addr;
-            if (remote->fd > 0) {
-                int r = getpeername(remote->fd, (struct sockaddr *) &addr, &len);
-                if (r == 0) {
-                    ev_timer_stop(loop, &remote->connect_timer_watcher);
-                    remote->connected = true;
-                    if (remote->buffer->len == 0) {
-                        ev_io_stop(loop, &remote->write_io_ctx->io);
-                        ev_io_start(loop, &server->read_io_ctx->io);
-                        return;
-                    }
-                    ev_io_start(loop, &remote->read_io_ctx->io);
-                    ev_io_start(loop, &server->read_io_ctx->io);
-                } else {
-                    LOG_PERROR("getpeername");
-                    // not connected
-                    close_and_free_remote(loop, remote);
-                    close_and_free_server(loop, server);
-                    return;
-                }
-            }
-        }
-        buffer_t *buffer = remote->buffer;
-        int write_n = (int) send(remote->fd, buffer->data, buffer->len, 0);
-        if (write_n == 0) {
-            close_and_free_server(loop, remote->server);
-            close_and_free_remote(loop, remote);
-            return;
-        }
-        if (write_n == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
-            } else {
-                LOG_PERROR("remote_write_cb");
-                close_and_free_server(loop, remote->server);
-                close_and_free_remote(loop, remote);
-                return;
-            }
-        }
-        if (write_n < buffer->len) {
-            buffer->len -= write_n;
-            memmove(buffer->data, buffer->data + write_n, buffer->len);
-            return;
-        }
-        // remote upstream all sent
-        buffer->len = 0;
-        // disable remote upstream io
-        ev_io_stop(loop, &remote->write_io_ctx->io);
-        // recover remote downstream io
-        ev_io_start(loop, &remote->read_io_ctx->io);
     }
 }

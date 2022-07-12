@@ -23,7 +23,7 @@ int main(int argc, char** argv) {
     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
 
     struct ev_io listen_ev_io = {};
-    ev_io_init(&listen_ev_io, sock_accept_cb, listen_fd, EV_READ);
+    ev_io_init(&listen_ev_io, socks_accept_cb, listen_fd, EV_READ);
     ev_io_start(loop, &listen_ev_io);
     ev_loop(loop, 0);
     return EXIT_SUCCESS;

@@ -6,9 +6,14 @@
 #include "csignal"
 
 #define SOCKET_BUF_SIZE (16 * 1024 - 1) // 16383 Byte, equals to the max chunk size
+
 #define SOCKS5_STAGE_INIT 0
 #define SOCKS5_STAGE_HANDSHAKE 1
 #define SOCKS5_STAGE_STREAM 2
+
+#define IPV4_INADDR_LEN (socklen_t) sizeof(in_addr)
+#define PORT_LEN (uint16_t) sizeof(in_port_t)
+#define CONNECT_TIMEOUT 10
 
 struct remote_t;
 struct server_t;
@@ -52,11 +57,10 @@ struct remote_t {
 static struct ev_signal sigint_watcher;
 static struct ev_signal sigterm_watcher;
 static struct ev_signal sigusr1_watcher;
-static struct ev_signal sigpip_watcher;
 
 void signal_cb(struct ev_loop* loop, ev_signal *w, int revents);
 
-void sock_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents);
+void socks_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents);
 
 
 
