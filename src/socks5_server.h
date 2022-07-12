@@ -62,6 +62,6 @@ void signal_cb(struct ev_loop* loop, ev_signal *w, int revents);
 
 void socks_accept_cb(struct ev_loop* loop, ev_io* watcher, int revents);
 
-
+void socks5_server_run(const char* server_host, const char* server_port);
 
 

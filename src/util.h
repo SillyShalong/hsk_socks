@@ -16,6 +16,13 @@ do { \
 } while (0)
 
 #define LOG_PERROR(x) perror(x)
+#ifdef DEBUG_LOG
+#define LOG_DEBUG(format, ...)  LOG_X("DEBUG",  format, ##__VA_ARGS__)
+#else
+#define LOG_DEBUG(format, ...)
+#endif
 #define LOG_INFO(format, ...)  LOG_X("INFO",  format, ##__VA_ARGS__)
 #define LOG_WARN(format, ...)  LOG_X("WARN",  format, ##__VA_ARGS__)
 #define LOG_ERROR(format, ...) LOG_X("ERROR", format, ##__VA_ARGS__)
+
+void chrono_start();
