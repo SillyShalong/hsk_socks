@@ -1,4 +1,4 @@
-# SOCKS5 server
+# Event driven Socks5Server base on libev
 tested on macos and ubuntu20.04
 only support socks version 5
 
