@@ -11,6 +11,7 @@ static void remote_write_cb(struct ev_loop* loop, ev_io* watcher, int wevents);
 #define PORT_LEN (uint16_t) sizeof(in_port_t)
 #define CONNECT_TIMEOUT 10
 
+// handle ev signal
 void signal_cb(struct ev_loop* loop, ev_signal *w, int revents) {
     if (revents & EV_SIGNAL) {
         switch (w->signum) {
@@ -20,12 +21,12 @@ void signal_cb(struct ev_loop* loop, ev_signal *w, int revents) {
                 ev_signal_stop(EV_DEFAULT, &sigint_watcher);
                 ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
                 ev_signal_stop(EV_DEFAULT, &sigusr1_watcher);
-                ev_signal_stop(EV_DEFAULT, &sigpip_watcher);
                 ev_unloop(EV_A_ EVUNLOOP_ALL);
         }
     }
 }
 
+// close and free socks5 server
 static void close_and_free_server(struct ev_loop* loop, server_t* server) {
     if (server->fd > 0) {
         if (server->read_io_ctx) {
@@ -51,6 +52,7 @@ static void close_and_free_server(struct ev_loop* loop, server_t* server) {
     }
 }
 
+// close and free remote connection
 static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
     if (remote->fd > 0) {
         ev_timer_stop(loop, &remote->connect_timer_watcher);
@@ -77,6 +79,7 @@ static void close_and_free_remote(struct ev_loop* loop, remote_t* remote) {
     }
 }
 
+// handle when remote connect() timeout
 static void remote_timeout_cb(struct ev_loop* loop, ev_timer *watcher, int revents) {
     auto *remote = (remote_t*) watcher;
     server_t *server = remote->server;
@@ -85,7 +88,7 @@ static void remote_timeout_cb(struct ev_loop* loop, ev_timer *watcher, int reven
     close_and_free_server(loop, server);
 }
 
-// socks5 method交换
+// socks5 method exchange
 static void socks_init(struct ev_loop* loop, server_t* server) {
     buffer_t* buffer = server->buffer;
     auto* request = (method_select_request*) buffer->data;
@@ -127,19 +130,19 @@ static void socks_init(struct ev_loop* loop, server_t* server) {
     }
 }
 
-// socks5 握手
+// socks5 handshake, only support connect command, determine if its ipv4 or domain request
 static void socks_handshake(struct ev_loop* loop, server_t* server) {
     buffer_t* buffer = server->buffer;
     auto* request = (socks5_request*) buffer->data;
     if (buffer->len < sizeof(socks5_request)) {
-        return; // 需要继续等待完整的客户端协议数据
+        return; // wait util entire request stream
     }
     if (request->cmd == SOCKS5_CMD_CONNECT) {
         sockaddr_in remote_addr{};
         if (request->atyp == SOCKS5_ATYP_IPV4) {
             int request_len = int(sizeof(socks5_request) + IPV4_INADDR_LEN + PORT_LEN);
             if (buffer->len < request_len) {
-                return; // 需要继续等待完整的客户端协议数据
+                return; // wait util entire request stream
             }
             char ipv4_addr_name[INET_ADDRSTRLEN];
             memset(ipv4_addr_name, 0, sizeof(ipv4_addr_name));
@@ -147,25 +150,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             char* port_ptr = buffer->data + sizeof(socks5_request) + IPV4_INADDR_LEN;
             uint16_t remote_port = *(uint16_t *) port_ptr;
             inet_ntop(AF_INET, ipv4_addr_ptr, ipv4_addr_name, sizeof(ipv4_addr_name));
-            sockaddr_in sock_addr = {};
-            memset(&sock_addr, 0, sizeof(sockaddr_in));
-            char response_buff[256];
-            socks5_response response = {};
-            response.ver = SOCKS_VERSION;
-            response.rep = SOCKS5_REP_SUCCEEDED;
-            response.rsv = 0x00;
-            response.atyp = SOCKS5_ATYP_IPV4;
-            memcpy(response_buff, &response, sizeof(socks5_response));
-            memcpy(response_buff + sizeof(socks5_response), &sock_addr.sin_addr, sizeof(sock_addr.sin_addr));
-            memcpy(response_buff + sizeof(socks5_response) + sizeof(sock_addr.sin_addr), &sock_addr.sin_port, sizeof(sock_addr.sin_port));
             LOG_INFO("upstream -> %s:%u", ipv4_addr_name, ntohs(remote_port));
-            int reply_size = sizeof(struct socks5_response) + sizeof(sock_addr.sin_addr) + sizeof(sock_addr.sin_port);
-            int send_size = (int) send(server->fd, response_buff, reply_size, 0);
-            if (send_size < reply_size) {
-                LOG_ERROR("handshake failure fd:%i", server->fd);
-                close_and_free_server(loop, server);
-                return;
-            }
             remote_addr.sin_family = AF_INET;
             remote_addr.sin_port = remote_port;
             memcpy(&remote_addr.sin_addr.s_addr, ipv4_addr_ptr, sizeof(in_addr_t));
@@ -177,7 +162,7 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             auto domain_name_len = (int8_t)request->dst_var[0];
             int domain_connect_len = int(sizeof(socks5_request) + 1 + domain_name_len + 2);
             if (buffer->len < domain_connect_len) {
-                return; // 需要继续等待完整的客户端协议数据
+                return; // wait util entire request stream
             }
             char domain_name[domain_name_len+1];
             domain_name[domain_name_len] = '\0';
@@ -192,25 +177,6 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
             char ipv4_addr_name[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &remote_addr.sin_addr, ipv4_addr_name, sizeof(ipv4_addr_name));
             LOG_INFO("upstream -> %s(%s):%u", domain_name, ipv4_addr_name, ntohs(nport_num));
-            // reply to client fake
-            sockaddr_in fake {};
-            memset(&fake, 0, sizeof(fake));
-            char response_buff[1024];
-            socks5_response response = {};
-            response.ver = SOCKS_VERSION;
-            response.rep = SOCKS5_REP_SUCCEEDED;
-            response.rsv = 0x00;
-            response.atyp = SOCKS5_ATYP_IPV4;
-            memcpy(response_buff, &response, sizeof(socks5_response));
-            memcpy(response_buff + sizeof(socks5_response), &fake.sin_addr, IPV4_INADDR_LEN);
-            memcpy(response_buff + sizeof(socks5_response) + IPV4_INADDR_LEN, &fake.sin_port, sizeof(fake.sin_port));
-            int reply_size = sizeof(struct socks5_response) + IPV4_INADDR_LEN + sizeof(fake.sin_port);
-            int send_size = (int) send(server->fd, response_buff, reply_size, 0);
-            if (send_size < reply_size) {
-                LOG_ERROR("handshake failure fd:%i", server->fd);
-                close_and_free_server(loop, server);
-                return;
-            }
             buffer->len -= domain_connect_len;
             if (buffer->len > 0) {
                 memmove(buffer->data, buffer->data + domain_connect_len, buffer->len);
@@ -223,7 +189,25 @@ static void socks_handshake(struct ev_loop* loop, server_t* server) {
         // create remote socket
         if ((server->remote->fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
             close_and_free_server(loop, server);
-
+            return;
+        }
+        // reply to client fake handshake response, which always succeed
+        sockaddr_in fake {};
+        memset(&fake, 0, sizeof(fake));
+        char response_buff[1024];
+        socks5_response response = {};
+        response.ver = SOCKS_VERSION;
+        response.rep = SOCKS5_REP_SUCCEEDED;
+        response.rsv = 0x00;
+        response.atyp = SOCKS5_ATYP_IPV4; // only support remote ipv4 right now
+        memcpy(response_buff, &response, sizeof(socks5_response));
+        memcpy(response_buff + sizeof(socks5_response), &fake.sin_addr, IPV4_INADDR_LEN);
+        memcpy(response_buff + sizeof(socks5_response) + IPV4_INADDR_LEN, &fake.sin_port, sizeof(fake.sin_port));
+        int reply_size = sizeof(struct socks5_response) + IPV4_INADDR_LEN + sizeof(fake.sin_port);
+        int send_size = (int) send(server->fd, response_buff, reply_size, 0);
+        if (send_size < reply_size) {
+            LOG_ERROR("handshake failure fd:%i", server->fd);
+            close_and_free_server(loop, server);
             return;
         }
         sock_set_nonblock(server->remote->fd);

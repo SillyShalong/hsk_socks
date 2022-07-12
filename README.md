@@ -26,8 +26,6 @@ curl -v -L --socks5 127.0.0.1:6788 https://www.baidu.com
 ```
 
 TODO:
-1. dns cache
-2. support ipv6
-3. custom log
-4. support udp
-5. up/down speed monitor
+1. ipv6
+2. udp
+3. up/down speed monitor
